@@ -65,7 +65,7 @@ def make_logger(log_dir: Path = None, mode: str = "train") -> str:
     :return: joeynmt version number
     """
     logger = logging.getLogger("")  # root logger
-    version = pkg_resources.require("joeynmt")[0].version
+    version = "2.0.0" # pkg_resources.require("joeynmt")[0].version
 
     # add handlers only once.
     if len(logger.handlers) == 0:
@@ -348,15 +348,15 @@ def parse_test_args(cfg: Dict) -> Tuple:
 
     # batch options
     batch_size: int = cfg.get("batch_size", 64)
-    batch_type: str = cfg.get("batch_type", "sentences")
+    batch_type: str = cfg.get("batch_type", "sentence")
     if batch_type not in ["sentence", "token"]:
         raise ConfigurationError(
             "Invalid `batch_type` option. Valid options: {`sentence`, `token`}.")
-    if batch_size > 1000 and batch_type == "sentence":
-        logger.warning(
-            "WARNING: Are you sure you meant to work on huge batches like this? "
-            "`batch_size` is > 1000 for sentence-batching. Consider decreasing it "
-            "or switching to `batch_type: 'token'`.")
+    # if batch_size > 1000 and batch_type == "sentence":
+    #     logger.warning(
+    #         "WARNING: Are you sure you meant to work on huge batches like this? "
+    #         "`batch_size` is > 1000 for sentence-batching. Consider decreasing it "
+    #         "or switching to `batch_type: 'token'`.")
 
     # limit on generation length
     max_output_length: int = cfg.get("max_output_length", -1)
@@ -450,7 +450,7 @@ def store_attention_plots(
     for i in indices:
         if i >= len(sources):
             continue
-        plot_file = f"{output_prefix}.{i}.png"
+        plot_file = f"{output_prefix}.{i}.pdf"
         src = sources[i]
         trg = targets[i]
         attention_scores = attentions[i].T

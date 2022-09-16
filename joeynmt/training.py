@@ -11,17 +11,21 @@ import sys
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, List, Tuple
+from operator import itemgetter 
 
 import torch
+import numpy as np
+torch.cuda.empty_cache()
 from torch import Tensor
 from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 
 from joeynmt.batch import Batch
 from joeynmt.builders import build_gradient_clipper, build_optimizer, build_scheduler
-from joeynmt.data import load_data
+from joeynmt.data import load_data, make_data_iter
 from joeynmt.helpers import (
+    expand_reverse_index,
     delete_ckpt,
     load_checkpoint,
     load_config,
@@ -29,13 +33,29 @@ from joeynmt.helpers import (
     make_logger,
     make_model_dir,
     parse_train_args,
+    parse_test_args,
     set_seed,
     store_attention_plots,
     symlink_update,
     write_list_to_file,
 )
 from joeynmt.model import Model, _DataParallel, build_model
-from joeynmt.prediction import predict, test
+from joeynmt.prediction import predict, test, translate
+import torch
+import torch.nn.functional as F
+from torch.utils.data import (
+    BatchSampler,
+    DataLoader,
+    Dataset,
+    RandomSampler,
+    Sampler,
+    SequentialSampler,
+    SubsetRandomSampler
+)
+from joeynmt.data import collate_fn,SentenceBatchSampler
+from functools import partial
+from joeynmt.search import search
+import copy
 
 # for fp16 training
 try:
@@ -165,9 +185,8 @@ class TrainManager:
             is_max_update=False,
             total_tokens=0,
             best_ckpt_iter=0,
-            best_ckpt_score=float("inf") if self.minimize_metric else float("-inf"),
+            best_ckpt_score=np.inf if self.minimize_metric else -np.inf,
             minimize_metric=self.minimize_metric,
-            total_correct=0,
         )
 
         # fp16
@@ -235,8 +254,6 @@ class TrainManager:
         model_path = Path(self.model_dir) / f"{self.stats.steps}.ckpt"
         model_state_dict = (self.model.module.state_dict() if isinstance(
             self.model, torch.nn.DataParallel) else self.model.state_dict())
-        train_iter_state = self.train_iter.batch_sampler.sampler.generator.get_state() \
-            if hasattr(self.train_iter.batch_sampler.sampler, 'generator') else None
         state = {
             "steps":
             self.stats.steps,
@@ -255,9 +272,7 @@ class TrainManager:
             "amp_state":
             amp.state_dict() if self.fp16 else None,
             "train_iter_state":
-            train_iter_state,
-            "total_correct":
-            self.stats.total_correct,
+            (self.train_iter.batch_sampler.sampler.generator.get_state()),
         }
         torch.save(state, model_path.as_posix())
 
@@ -327,7 +342,6 @@ class TrainManager:
         """
         logger.info("Loading model from %s", path)
         model_checkpoint = load_checkpoint(path=path, device=self.device)
-
         # restore model and optimizer parameters
         self.model.load_state_dict(model_checkpoint["model_state"])
 
@@ -354,7 +368,6 @@ class TrainManager:
             assert "train_iter_state" in model_checkpoint
             self.stats.steps = model_checkpoint["steps"]
             self.stats.total_tokens = model_checkpoint["total_tokens"]
-            self.stats.total_correct = model_checkpoint.get("total_correct", 0)
             self.train_iter_state = model_checkpoint["train_iter_state"]
         else:
             # reset counters if explicitly 'train_iter_state: True' in config
@@ -392,7 +405,8 @@ class TrainManager:
         :param valid_data: validation data
         """
         # pylint: disable=too-many-branches,too-many-statements
-        self.train_iter = train_data.make_iter(
+        self.train_iter = make_data_iter(
+            dataset=train_data,
             batch_size=self.batch_size,
             batch_type=self.batch_type,
             seed=self.seed,
@@ -445,7 +459,7 @@ class TrainManager:
             self.batch_size // self.n_gpu if self.n_gpu > 1 else self.batch_size,
             self.batch_size * self.batch_multiplier,
         )
-
+        valid_duration = self._validate(valid_data)
         try:
             for epoch_no in range(self.epochs):
                 logger.info("EPOCH %d", epoch_no + 1)
@@ -459,10 +473,10 @@ class TrainManager:
                 start = time.time()
                 total_valid_duration = 0
                 start_tokens = self.stats.total_tokens
-                start_correct = self.stats.total_correct
                 self.model.zero_grad()
                 epoch_loss = 0
                 total_batch_loss = 0
+                total_n_correct = 0
 
                 # subsample train data each epoch
                 if train_data.random_subset > 0:
@@ -483,8 +497,9 @@ class TrainManager:
                     batch.sort_by_src_length()
 
                     # get batch loss
-                    norm_batch_loss = self._train_step(batch)
+                    norm_batch_loss, n_correct = self._train_step(batch)
                     total_batch_loss += norm_batch_loss
+                    total_n_correct += n_correct
 
                     # update!
                     if (i + 1) % self.batch_multiplier == 0:
@@ -515,12 +530,11 @@ class TrainManager:
                         if self.stats.steps % self.logging_freq == 0:
                             elapsed = time.time() - start - total_valid_duration
                             elapsed_tok = self.stats.total_tokens - start_tokens
-                            elapsed_correct = self.stats.total_correct - start_correct
+                            token_accuracy = total_n_correct / elapsed_tok
                             self.tb_writer.add_scalar("train/batch_loss",
                                                       total_batch_loss,
                                                       self.stats.steps)
-                            self.tb_writer.add_scalar("train/batch_acc",
-                                                      elapsed_correct / elapsed_tok,
+                            self.tb_writer.add_scalar("train/batch_acc", token_accuracy,
                                                       self.stats.steps)
                             logger.info(
                                 "Epoch %3d, "
@@ -532,18 +546,18 @@ class TrainManager:
                                 epoch_no + 1,
                                 self.stats.steps,
                                 total_batch_loss,
-                                elapsed_correct / elapsed_tok,
+                                token_accuracy,
                                 elapsed_tok / elapsed,
                                 self.optimizer.param_groups[0]["lr"],
                             )
                             start = time.time()
                             total_valid_duration = 0
                             start_tokens = self.stats.total_tokens
-                            start_correct = self.stats.total_correct
 
                         # update epoch_loss
                         epoch_loss += total_batch_loss  # accumulate loss
                         total_batch_loss = 0  # reset batch loss
+                        total_n_correct = 0  # reset batch accuracy
 
                         # validate on the entire dev set
                         if self.stats.steps % self.validation_freq == 0:
@@ -611,7 +625,7 @@ class TrainManager:
         )
 
         # sum over multiple gpus
-        sum_correct_tokens = batch.normalize(correct_tokens, "sum", self.n_gpu)
+        n_correct_tokens = batch.normalize(correct_tokens, "sum", self.n_gpu)
 
         # accumulate gradients
         if self.fp16:
@@ -622,9 +636,8 @@ class TrainManager:
 
         # increment token counter
         self.stats.total_tokens += batch.ntokens
-        self.stats.total_correct += sum_correct_tokens.item()
 
-        return norm_batch_loss.item()
+        return norm_batch_loss.item(), n_correct_tokens.item()
 
     def _validate(self, valid_data: Dataset):
         if valid_data.random_subset > 0:  # subsample validation set each valid step
@@ -647,6 +660,7 @@ class TrainManager:
             valid_hypotheses_raw,
             valid_sequence_scores,  # pylint: disable=unused-variable
             valid_attention_scores,
+            _
         ) = predict(
             model=self.model,
             data=valid_data,
@@ -771,9 +785,8 @@ class TrainManager:
             is_max_update: bool = False,
             total_tokens: int = 0,
             best_ckpt_iter: int = 0,
-            best_ckpt_score: float = float("inf"),
+            best_ckpt_score: float = np.inf,
             minimize_metric: bool = True,
-            total_correct: int = 0,
         ) -> None:
             self.steps = steps  # global update step counter
             self.is_min_lr = is_min_lr  # stop by reaching learning rate minimum
@@ -782,7 +795,6 @@ class TrainManager:
             self.best_ckpt_iter = best_ckpt_iter  # store iteration point of best ckpt
             self.best_ckpt_score = best_ckpt_score  # initial values for best scores
             self.minimize_metric = minimize_metric  # minimize or maximize score
-            self.total_correct = total_correct  # number of correct tokens seen so far
 
         def is_best(self, score):
             if self.minimize_metric:
@@ -847,6 +859,7 @@ def train(cfg_file: str, skip_test: bool = False) -> None:
     model = build_model(cfg["model"], src_vocab=src_vocab, trg_vocab=trg_vocab)
 
     # for training management, e.g. early stopping and model selection
+    
     trainer = TrainManager(model=model, cfg=cfg)
 
     # train the model
@@ -874,8 +887,395 @@ def train(cfg_file: str, skip_test: bool = False) -> None:
     else:
         logger.info("Skipping test after training")
 
+        
+        
+        
+
+'''
+Each query strategy below returns a list of len=query_size with indices of 
+samples that are to be queried.
+
+Arguments:
+- model (torch.nn.Module): not needed for `random_query`
+- device (torch.device): not needed for `random_query`
+- dataloader (torch.utils.data.DataLoader)
+- query_size (int): number of samples to be queried for labels (default=10)
+
+'''
+
+def random_query(query_size=10, random_idx=None):
+    logger.info("Executing Random Strategy")
+    # Because the data has already been shuffled inside the data loader,
+    # we can simply return the `query_size` first samples from it
+    
+    return random_idx[0:query_size]
+
+def least_confidence_query(query_size=10, random_idx=None,batch_size=128, cfg_file=None,data=None,ckpt=None):
+
+    margins = []
+    indices = []
+
+    batch_result = batch_test_n_best(random_idx,data,cfg_file,ckpt,batch_size)
+    probabilities = torch.as_tensor(np.vstack(list(batch_result.values())))
+            
+       
+
+    # Keep only the top class confidence for each sample
+    most_probable = torch.max(probabilities, dim=1)[0]
+    confidences.extend(most_probable.cpu().tolist())
+    indices.extend(np.hstack(list(batch_result.keys())))
+            
+    conf = np.asarray(confidences)
+    ind = np.asarray(indices)
+    sorted_pool = np.argsort(conf)
+    # Return the indices corresponding to the lowest `query_size` confidences
+    return ind[sorted_pool][0:query_size]
+    
+
+def margin_query(query_size=10, random_idx=None,batch_size=128, cfg_file=None,data=None,ckpt=None):
+     
+    margins = []
+    indices = []
+    total_nseqs = 0
+    
+    batch_result = batch_test_n_best(random_idx,data,cfg_file,ckpt,batch_size)
+    probabilities = torch.as_tensor(np.vstack(list(batch_result.values())))
+            
+       
+    # Select the top two class confidences for each sample
+    toptwo = torch.topk(probabilities, 2,dim=1)[0]
+
+    # Compute the margins = differences between the two top confidences
+    differences = toptwo[:,0]-toptwo[:,1]
+    margins.extend(torch.abs(differences).cpu().tolist())
+    indices.extend(np.hstack(list(batch_result.keys())))
+
+    margin = np.asarray(margins)
+    index = np.asarray(indices)
+    sorted_pool = np.argsort(margin)
+    # Return the indices corresponding to the lowest `query_size` margins
+    # print(index[sorted_pool][0:query_size])
+    return index[sorted_pool][0:query_size]
+
+
+def generate_data_d(batch,data,cfg_file,ckpt):
+    idx_ = np.arange(batch.src.shape[0])
+    # _, _, idx = batch
+    # sample_idx.extend(idx.tolist())
+    sent_list = {}
+    for sent_id in idx_:
+        sent = " ".join(data.display(sent_id))
+        # print(sent)
+        hypotheses, tokens, scores, _, batch_results = translate(cfg_file,ckpt,output_path=None,input_str=sent)
+        # print(scores)
+        sent_list[sent_id] = [i[0] for i in scores]
+    # print(sent_list)
+    return sent_list
+
+# def batch_test_n_best(batch,data,cfg_file,ckpt,batch_size):
+
+#     n = batch_size
+#     # using list comprehension
+#     batches = [batch[i:i + n] for i in range(0, len(batch), n)]
+#     # idx_ = batch# np.arange(sen_batch) # you can use random one
+
+#     sent_list_b = {} 
+#     for cnt, idx_ in enumerate(batches):
+#         logger.info(f"Processing Predictions on Batch {str(cnt)}/{str(len(batches))}")
+#         sent=[]
+#         for sent_id in idx_:
+#             sent.append(" ".join(data.display(sent_id)))
+#         hypotheses, _, _, _, batch_results = translate(cfg_file,ckpt,output_path=None,input_str=sent)
+
+#         scores=batch_results['scores']  # size: batch_size,n_best
+
+#         for index, score in zip(idx_,scores):
+#             sent_list_b[index] = [val.item() for val in score]
+
+#     return sent_list_b
+
+sent_list_global ={}
+def batch_test_n_best(batch,data,cfg_file,ckpt,batch_size):
+
+    n = batch_size
+    # using list comprehension
+    batches = [batch[i:i + n] for i in range(0, len(batch), n)]
+    # idx_ = batch# np.arange(sen_batch) # you can use random one
+
+    sent_list_b = {} 
+    for cnt, idx_ in enumerate(batches):
+        logger.info(f"Processing Predictions on Batch {str(cnt)}/{str(len(batches))}")
+        sent=[]
+        idx_new = []
+        for sent_id in idx_:
+            if not sent_list_global.get(sent_id):
+                dat_val = data.display(sent_id)
+                if dat_val:
+                    sent.append(" ".join(dat_val))
+                    idx_new.append(sent_id)
+            else:
+                sent_list_b[sent_id] = sent_list_global.get(sent_id)
+        hypotheses, _, _, _, batch_results = translate(cfg_file,ckpt,output_path=None,input_str=sent)
+
+        scores=batch_results['scores']  # size: batch_size,n_best
+
+        for index, score in zip(idx_new,scores):
+            sent_list_b[index] = [val.item() for val in score]
+            sent_list_global[index] = [val.item() for val in score]
+
+    return sent_list_b
+
+def query_the_oracle(dataset, query_size=10, query_strategy='random', 
+                     interactive=True, pool_size=0, batch_size=128, cfg_file=None,ckpt=None):
+    
+    # unlabeled_idx = np.nonzero(dataset.unlabeled_mask)[0]
+
+    
+    # Select a pool of samples to query from
+    if pool_size > 0:
+        percent = int(pool_size * dataset._initial_len * 0.01)
+        random_idx = np.random.choice(np.arange(dataset._initial_len), size = percent)
+        
+    else:
+        percent = int(1 * dataset._initial_len * 0.01)
+        random_idx = np.random.choice(np.arange(dataset._initial_len), size = percent)
+    logger.info("Random Indices picked: "+ str(random_idx[0:10])+" length: "+str(len(random_idx)) )
+        
+    if query_strategy == 'margin':
+        sample_idx = margin_query(query_size, random_idx, batch_size,cfg_file=cfg_file, data=dataset, ckpt=ckpt)
+    elif query_strategy == 'least_confidence':
+        sample_idx = least_confidence_query(query_size, random_idx, batch_size, cfg_file=cfg_file, data=dataset, ckpt=ckpt)
+    else:
+        sample_idx = random_query(query_size, random_idx)
+    logger.info("Final Query Indices picked: "+ str(list(sample_idx)[0:10])+" length: "+str(len(sample_idx)) )
+    # Query the samples, one at a time
+    logger.info("Query the samples, one at a time (interactive/file)")
+    for sample in sample_idx:
+        
+        if interactive:
+            dataset.display(sample,)
+            print("What is the translation for this sentence?")
+            new_label = input()
+            dataset.update_label(sample, new_label)
+            
+        else:
+            dataset.label_from_file(sample)
+    return sample_idx
+
+def add_old_data(dataset,old_dataset):
+        # import pdb; pdb.set_trace()
+        src_lang=dataset.src_lang
+        trg_lang=dataset.trg_lang
+        new_data=copy.deepcopy(dataset)
+        new_sen_data=new_data.data
+        old_sen_data=old_dataset.data
+
+        old_sen_data_src = old_sen_data[src_lang]
+        old_sen_data_trg = old_sen_data[trg_lang]
+        new_sen_data_src = new_sen_data[src_lang]
+        new_sen_data_trg = new_sen_data[trg_lang]
+
+        src_sen=old_sen_data_src + new_sen_data_src
+        trg_sen=old_sen_data_trg + new_sen_data_trg
+
+        new_data.data = {src_lang:src_sen,trg_lang:trg_sen}
+        new_data._initial_len=len(new_data.data[new_data.src_lang])
+        return new_data
+
+def gen_al_dataset(train_dataset, old_dataset=None, indexs=None, percent=None):
+    def map_indexs(dataset,postions):
+        new_data=copy.deepcopy(dataset)
+        sen_data=new_data.data
+#         src=np.array(sen_data[src_lang])
+#         trg=np.array(sen_data[trg_lang])
+#         src_sen=src[postions].tolist()
+#         trg_sen=trg[postions].tolist()
+        src_sen=itemgetter(*postions)(sen_data[src_lang])
+        trg_sen=itemgetter(*postions)(sen_data[trg_lang])
+        assert len(src_sen)==len(trg_sen)
+        new_data.data={src_lang:src_sen,trg_lang:trg_sen}
+        new_data._initial_len=len(postions)
+        return new_data    
+
+    train_dataset.al_dataset=True
+    src_lang=train_dataset.src_lang
+    trg_lang=train_dataset.trg_lang
+    len_=len(train_dataset.data[src_lang])
+    
+    if not percent:
+        #indexes coming from model which need to re_train
+        indexs=np.array(indexs)
+    else:
+        random_subset=int((len_*0.01)*percent)
+        indexs=np.arange(random_subset)
+    
+    full_data_len= np.arange(len_)
+    pool_indexs=np.delete(full_data_len,indexs)
+    
+    # just copy object
+    subset_data=map_indexs(train_dataset,indexs)
+    pool_data=map_indexs(train_dataset,pool_indexs)
+    train_dataset.al_dataset=False
+
+    if old_dataset:
+        subset_data = add_old_data(subset_data,old_dataset)
+    
+    return pool_data, subset_data            
+
+def train_model_ac(cfg_file: str, ckpt: str = None, skip_test: bool = False) -> Any:
+    """
+    Main training function. After training, also test on test data if given.
+
+    :param cfg_file: path to configuration yaml file
+    :param skip_test: whether a test should be run or not after training
+    :return:
+        - model
+    """
+    
+
+    # read config file
+    cfg = load_config(Path(cfg_file))
+    ckpt=cfg['training'].get('load_model','')
+    baseline_train=False if Path(ckpt).is_file() else True
+    # make logger
+    model_dir = make_model_dir(
+        Path(cfg["training"]["model_dir"]),
+        overwrite=cfg["training"].get("overwrite", False),
+    )
+    joeynmt_version = make_logger(model_dir, mode="train")
+    if "joeynmt_version" in cfg:
+        assert str(joeynmt_version) == str(cfg["joeynmt_version"]), (
+            f"You are using JoeyNMT version {joeynmt_version}, "
+            f'but {cfg["joeynmt_version"]} is expected in the given config.')
+    # TODO: save version number in model checkpoints
+
+    # write all entries of config to the log
+    log_cfg(cfg)
+
+    # store copy of original training config in model dir
+    shutil.copy2(cfg_file, (model_dir / "config.yaml").as_posix())
+
+    # set the random seed
+    set_seed(seed=cfg["training"].get("random_seed", 42))
+
+    # load the data
+    src_vocab, trg_vocab, train_data, dev_data, test_data = load_data(
+        data_cfg=cfg["data"])
+
+    # store the vocabs and tokenizers
+    src_vocab.to_file(model_dir / "src_vocab.txt")
+    if hasattr(train_data.tokenizer[train_data.src_lang], "copy_cfg_file"):
+        train_data.tokenizer[train_data.src_lang].copy_cfg_file(model_dir)
+    trg_vocab.to_file(model_dir / "trg_vocab.txt")
+    if hasattr(train_data.tokenizer[train_data.trg_lang], "copy_cfg_file"):
+        train_data.tokenizer[train_data.trg_lang].copy_cfg_file(model_dir)
+
+    ###################### BASELINE MODEL START#########################
+    # build an encoder-decoder model
+    logger.info("BASELINE MODEL START")
+    al_params=cfg["active_learning"]
+    model = build_model(cfg["model"], src_vocab=src_vocab, trg_vocab=trg_vocab)
+    train_data, al_data= gen_al_dataset(train_data, percent=al_params.get('al_percent',43)) ## Split the train data into two for geenrating baseline model and to keep another for activate learning 
+    # for training management, e.g. early stopping and model selection
+    trainer = TrainManager(model=model, cfg=cfg)
+    if baseline_train:
+        # train the model
+        trainer.train_and_validate(train_data=train_data, valid_data=dev_data)
+        if not skip_test:
+                # predict with the best model on validation and test
+                # (if test data is available)
+                ckpt = model_dir / f"{trainer.stats.best_ckpt_iter}.ckpt"
+                output_path = model_dir / f"{trainer.stats.best_ckpt_iter:08d}.hyps"
+
+                datasets_to_test = {
+                    "dev": dev_data,
+                    "test": test_data,
+                    "src_vocab": src_vocab,
+                    "trg_vocab": trg_vocab,
+                }
+                test(
+                    cfg_file,
+                    ckpt=ckpt.as_posix(),
+                    output_path=output_path.as_posix(),
+                    datasets=datasets_to_test,
+                )
+    logger.info("BASELINE MODEL END")
+    ###################### BASELINE MODEL END #########################
+    
+    al_epoch = al_params.get('epoch',5)
+    cfg['training']['epochs'] = al_epoch
+    trainer.epochs = al_epoch
+    trainer.validation_freq = al_params.get('validation_freq',500)
+    
+    ###################### Active Learning MODEL START #########################
+    
+    logger.info("ACTIVE LEARNING MODEL START - RANDOM ")
+    labeled_idx = query_the_oracle(al_data, 
+                     query_size=al_params.get('query_size',10000),  # num of sent to pick
+                     query_strategy='random',
+                     interactive=al_params.get('interactive',False), 
+                     pool_size=al_params.get('pool_size',20), # 20% of al data to pick
+                     batch_size=al_params.get('batch_size',256), 
+                     cfg_file=cfg_file)
+    
+    al_data, al_data_to_train= gen_al_dataset(al_data, indexs=labeled_idx)
+    new_train_data = add_old_data(al_data_to_train,train_data)
+    logger.info("Remaining Pool Data size: "+str(al_data._initial_len))
+    logger.info("Active Learning Data ready to train size: "+str(new_train_data._initial_len))
+
+    
+    # train the model
+    trainer.train_and_validate(train_data=new_train_data, valid_data=dev_data) # pick 10k sent from random and train again for AL
+    logger.info("ACTIVE LEARNING MODEL END - RANDOM ")
+    num_queries = al_params['num_queries']
+    for query in range(num_queries):
+        # import pdb; pdb.set_trace() 
+        # Query the oracle for more labels
+        logger.info("ACTIVE LEARNING MODEL START - MARGIN "+ str(query))
+        labeled_idx = query_the_oracle(al_data, 
+                         query_size=al_params.get('query_size',10000),  # num of sent to pick
+                         query_strategy=al_params.get('query_strategy','margin'), 
+                         interactive=al_params.get('interactive',False), 
+                         pool_size=al_params.get('pool_size',20), # 100% of al data to pick
+                         batch_size=al_params.get('batch_size',256), 
+                         cfg_file=cfg_file,
+                         ckpt=ckpt)
+
+        # Train the model on the data that has been labeled so far:
+        al_data, al_data_to_train = gen_al_dataset(al_data, old_dataset=al_data_to_train, indexs=labeled_idx)
+        new_train_data = add_old_data(al_data_to_train,train_data)
+        # train the model
+        trainer.train_and_validate(train_data=new_train_data, valid_data=dev_data)
+        # Test the model:
+        if not skip_test:
+            # predict with the best model on validation and test
+            # (if test data is available)
+            ckpt_old = ckpt
+            ckpt = model_dir / f"{trainer.stats.best_ckpt_iter}.ckpt"
+            output_path = model_dir / f"{trainer.stats.best_ckpt_iter:08d}.hyps"
+            logger.info("Loading from ckpt file: "+str(ckpt))
+            if Path(ckpt).is_file():
+                datasets_to_test = {
+                    "dev": dev_data,
+                    "test": test_data,
+                    "src_vocab": src_vocab,
+                    "trg_vocab": trg_vocab,
+                }
+                test(
+                    cfg_file,
+                    ckpt=ckpt.as_posix(),
+                    output_path=output_path.as_posix(),
+                    datasets=datasets_to_test,
+                )
+            else:
+                logger.info("ckpt file not found"+ str(ckpt))
+                ckpt = ckpt_old
+        logger.info("ACTIVE LEARNING MODEL END - MARGIN "+ str(query))
+
+
 
 if __name__ == "__main__":
+    torch.multiprocessing.set_start_method('spawn')
     parser = argparse.ArgumentParser("Joey-NMT")
     parser.add_argument(
         "config",
@@ -884,4 +1284,6 @@ if __name__ == "__main__":
         help="Training configuration file (yaml).",
     )
     args = parser.parse_args()
-    train(cfg_file=args.config)
+    # cfg_file = "/home/ubuntu/joeynmt_kriti/test/data/models/v1_enhi_25_transformer_23.04bleu/enhi_transformer_t1/config.yaml"
+    ckpt = "/home/ubuntu/joeynmt_kriti/test/data/models/v2_enhi_10_transformer/enhi_transformer_t1_baseline/2000.ckpt"
+    train_model_ac(cfg_file=args.config, ckpt=ckpt)

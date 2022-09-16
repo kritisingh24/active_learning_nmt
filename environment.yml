@@ -1,0 +1,31 @@
+name: py39
+channels:
+  - defaults
+dependencies:
+  - python=3.7
+  - torchaudio
+  - cudatoolkit
+  - pytorch
+  - torchvision
+  - jupyter=1.0.0
+  - pip
+  - pip:
+    - future==0.18.2
+    - pillow==9.2.0
+    - numpy>=1.19.5
+    - setuptools>=41.0.0
+    - protobuf==3.20.1
+    - tensorboard>=1.15
+    - sacrebleu>=2.0.0
+    - sentencepiece==0.1.96
+    - subword-nmt==0.3.8
+    - matplotlib==3.5.2
+    - seaborn==0.11.2
+    - pyyaml>=5.1
+    - six>=1.12
+    - wrapt>=1.11.1
+    - pylint==2.14.5
+    - yapf==0.32.0
+    - flake8==5.0.3
+    - pytest==7.1.2
+    - datasets==2.4.0

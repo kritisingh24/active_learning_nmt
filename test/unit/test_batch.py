@@ -4,8 +4,7 @@ import torch
 from torch.utils.data import BatchSampler, DataLoader, RandomSampler, SequentialSampler
 
 from joeynmt.batch import Batch
-from joeynmt.data import load_data
-from joeynmt.datasets import TokenBatchSampler
+from joeynmt.data import TokenBatchSampler, load_data, make_data_iter
 
 
 class TestBatch(TensorTestCase):
@@ -49,7 +48,8 @@ class TestBatch(TensorTestCase):
         self.assertEqual(len(self.train_data), 1000)
 
         # make data iterator
-        train_iter = self.train_data.make_iter(
+        train_iter = make_data_iter(
+            dataset=self.train_data,
             batch_size=batch_size,
             batch_type="sentence",
             shuffle=True,
@@ -97,7 +97,8 @@ class TestBatch(TensorTestCase):
         self.assertEqual(len(self.train_data), 1000)
 
         # make data iterator
-        train_iter = self.train_data.make_iter(
+        train_iter = make_data_iter(
+            dataset=self.train_data,
             batch_size=batch_size,
             batch_type="token",
             shuffle=True,
@@ -141,7 +142,8 @@ class TestBatch(TensorTestCase):
         self.assertEqual(len(self.dev_data), 20)
 
         # make data iterator
-        dev_iter = self.dev_data.make_iter(
+        dev_iter = make_data_iter(
+            dataset=self.dev_data,
             batch_size=batch_size,
             batch_type="sentence",
             shuffle=False,

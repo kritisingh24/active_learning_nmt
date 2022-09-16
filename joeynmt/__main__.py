@@ -1,7 +1,7 @@
 import argparse
 
 from joeynmt.prediction import test, translate
-from joeynmt.training import train
+from joeynmt.training import train, train_model_ac
 
 
 def main():
@@ -37,6 +37,7 @@ def main():
         action="store_true",
         help="Skip test after training",
     )
+    
 
     args = ap.parse_args()
 
@@ -56,6 +57,12 @@ def main():
             ckpt=args.ckpt,
             output_path=args.output_path,
         )
+    elif args.mode == "active_learning":
+        train_model_ac(
+            cfg_file=args.config_path,
+            ckpt=args.ckpt
+        )
+        
     else:
         raise ValueError("Unknown mode")
 

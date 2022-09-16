@@ -1,0 +1,121 @@
+
+name: "transformer_25_enhi_bpe"
+joeynmt_version: "2.0.0"
+
+data:
+    train: "/home/ubuntu/joeynmt_kriti/test/data/datasets_enhi_25_23.04bleu/train_tok"
+    dev: "/home/ubuntu/joeynmt_kriti/test/data/datasets_enhi_25_23.04bleu/val_tok"
+    test: "/home/ubuntu/joeynmt_kriti/test/data/datasets_enhi_25_23.04bleu/test_tok"
+    dataset_type: "plain_ac"
+    # dataset_cfg:           # not necessary for manually saved pyarray daraset
+    #     name: "en-hi"
+    src:
+        lang: "en"
+        max_length: 60
+        lowercase: False
+        level: "bpe"
+        voc_file: "/home/ubuntu/joeynmt_kriti/test/data/datasets_enhi_25_23.04bleu/vocab.en"
+        tokenizer_type: "subword-nmt"
+        tokenizer_cfg:
+            codes: "/home/ubuntu/joeynmt_kriti/test/data/datasets_enhi_25_23.04bleu/en.bpe.codes"
+            num_merges: 32000
+            pretokenizer: "moses"
+
+    trg:
+        lang: "hi"
+        max_length: 60
+        lowercase: False
+        level: "bpe"
+        voc_file: "/home/ubuntu/joeynmt_kriti/test/data/datasets_enhi_25_23.04bleu/vocab.hi"
+        tokenizer_type: "subword-nmt"
+        tokenizer_cfg:
+            codes: "/home/ubuntu/joeynmt_kriti/test/data/datasets_enhi_25_23.04bleu/hi.bpe.codes"
+            num_merges: 32000
+            pretokenizer: "none"
+
+
+testing:
+    n_best: 1
+    beam_size: 5
+    beam_alpha: 1.0
+    batch_size: 1024
+    batch_type: "token"
+    max_output_length: 60
+    eval_metrics: ["bleu"]
+    return_prob: "hyp"
+    return_attention: True
+    sacrebleu_cfg:
+        tokenize: "13a"
+        lowercase: False
+
+training:
+    load_model: "/home/ubuntu/joeynmt_kriti/test/data/models/v1_enhi_25_transformer_23.04bleu/enhi_transformer_t1/81000.ckpt"
+    reset_best_ckpt: False
+    reset_scheduler: False
+    reset_optimizer: False
+    reset_iter_state: False
+    random_seed: 42
+    optimizer: "adam"
+    normalization: "tokens"
+    adam_betas: [0.9, 0.999] 
+    scheduling: "plateau"            # Try switching to Elan scheduling
+    learning_rate_decay_length: 2500 # number of steps to reduce by the decay factor for Elan method
+    learning_rate_peak: 0.005  # peak for Elan scheduler (default: 1)
+    learning_rate_warmup: 1000  # warmup steps for Elan scheduler
+    learning_rate_factor: 0.5       # factor for Noam scheduler (used with Transformer)
+    patience: 5
+    decrease_factor: 0.7
+    loss: "crossentropy"
+    learning_rate: 0.0003
+    learning_rate_min: 0.00000001
+    weight_decay: 0.0
+    label_smoothing: 0.1
+    batch_size: 4096
+    batch_type: "token"
+    batch_multiplier: 1
+    early_stopping_metric: "ppl"
+    epochs: 1 # TODO: Decrease for when playing around and checking of working. Around 30 is sufficient to check if its working at all
+    validation_freq: 1000 # 4000 # Decrease this for testing
+    logging_freq: 100
+    model_dir: "/home/ubuntu/joeynmt_kriti/test/data/models/v1_enhi_25_transformer_23.04bleu/enhi_transformer_t1_resume"
+    overwrite: False
+    shuffle: True
+    use_cuda: True
+    print_valid_sents: [0, 1, 2, 3]
+    keep_best_ckpts: 3
+
+model:
+    initializer: "xavier"
+    bias_initializer: "zeros"
+    init_gain: 1.0
+    embed_initializer: "xavier"
+    embed_init_gain: 1.0
+    tied_embeddings: False
+    tied_softmax: True
+    encoder:
+        type: "transformer"
+        num_layers: 6
+        num_heads: 4
+        embeddings:
+            embedding_dim: 256
+            scale: True
+            dropout: 0.2
+        # typically ff_size = 4 x hidden_size
+        hidden_size: 256
+        ff_size: 1024
+        dropout: 0.3
+        layer_norm: "pre"
+    decoder:
+        type: "transformer"
+        num_layers: 6
+        num_heads: 4
+        embeddings:
+            embedding_dim: 256
+            scale: True
+            dropout: 0.2
+        # typically ff_size = 4 x hidden_size
+        hidden_size: 256
+        ff_size: 1024
+        dropout: 0.3
+        layer_norm: "pre"
+

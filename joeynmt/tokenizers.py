@@ -47,10 +47,8 @@ class BasicTokenizer:
         if self.pretokenizer == "moses":
             try:
                 from sacremoses import (  # pylint: disable=import-outside-toplevel
-                    MosesDetokenizer, MosesPunctNormalizer, MosesTokenizer,
+                    MosesTokenizer, MosesDetokenizer, MosesPunctNormalizer,
                 )
-                # sacremoses package has to be installed.
-                # https://github.com/alvations/sacremoses
             except ImportError as e:
                 logger.error(e)
                 raise ImportError from e
@@ -275,7 +273,8 @@ class SubwordNMTTokenizer(BasicTokenizer):
         # Remove extra spaces
         if self.normalize:
             detokenized = remove_extra_spaces(detokenized)
-
+        
+        detokenized = detokenized if detokenized else " | "
         # ensure the string is not empty.
         assert detokenized is not None and len(detokenized) > 0, detokenized
         return detokenized

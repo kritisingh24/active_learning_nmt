@@ -13,6 +13,7 @@ from joeynmt.batch import Batch
 from joeynmt.decoders import RecurrentDecoder, TransformerDecoder
 from joeynmt.helpers import tile
 from joeynmt.model import Model
+import copy
 
 __all__ = ["greedy", "beam_search", "search"]
 
@@ -274,6 +275,7 @@ def transformer_greedy(
     output = ys[:, 1:].detach().cpu().numpy()
     scores = yv[:, 1:].detach().cpu().numpy() if return_prob else None
     attention = yt[:, 1:, :].detach().cpu().numpy() if return_attention else None
+    output={'joeynmt':output,'batch_results':None}
     return output, scores, attention
 
 
@@ -571,10 +573,21 @@ def beam_search(
                         if len(pred) < max_output_length:
                             assert (
                                 pred[-1] == eos_index
-                            ), f"adding a candidate which doesn't end with eos: {pred}"
+                            ), f"adding a candidate which doesn't end with eos: {pred}"                          
                         results["scores"][b].append(score)
                         results["predictions"][b].append(pred)
-
+                    if len(results["scores"][b]) < n_best:
+                        value_last = results["scores"][b][-1]
+                        num_times = n_best - len(results["scores"][b])
+                        iter_value = [value_last]*num_times
+                        results["scores"][b].extend(iter_value)
+                    if len(results["predictions"][b]) < n_best:
+                        value_last = results["predictions"][b][-1]
+                        num_times = n_best - len(results["predictions"][b])
+                        iter_value = [value_last]*num_times
+                        results["predictions"][b].extend(iter_value)
+                    
+                            
             # batch indices of the examples which contain unfinished candidates
             unfinished = end_condition.eq(False).nonzero(as_tuple=False).view(-1)
             # if all examples are translated, no need to go further
@@ -609,8 +622,10 @@ def beam_search(
                 -1, alive_seq.size(-1))
             if encoder_input is not None:
                 src_len = encoder_input.size(-1)
-                encoder_input = encoder_input.view(-1, beam_size, src_len) \
-                    .index_select(0, unfinished).view(-1, src_len)
+                encoder_input = (encoder_input.view(-1, beam_size,
+                                                    src_len).index_select(
+                                                        0,
+                                                        unfinished).view(-1, src_len))
                 assert encoder_input.size(0) == alive_seq.size(0)
 
         # reorder indices, outputs and masks
@@ -632,36 +647,51 @@ def beam_search(
         if att_vectors is not None:
             att_vectors = att_vectors.index_select(0, select_indices)
 
-    # if num_predictions < n_best, fill the results list up with UNK.
-    for b in range(batch_size):
-        num_predictions = len(results["predictions"][b])
-        num_scores = len(results["scores"][b])
-        assert num_predictions == num_scores
-        for _ in range(n_best - num_predictions):
-            results["predictions"][b].append(torch.tensor([unk_index]).long())
-            results["scores"][b].append(torch.tensor([-1]).float())
-        assert len(results["predictions"][b]) == n_best
-        assert len(results["scores"][b]) == n_best
-
     def pad_and_stack_hyps(hyps: List[np.ndarray]):
-        max_len = max([hyp.shape[0] for hyp in hyps])
-        filled = np.ones((len(hyps), max_len), dtype=int) * pad_index
+        filled = (np.ones(
+            (len(hyps), max([h.shape[0] for h in hyps])), dtype=int) * pad_index)
         for j, h in enumerate(hyps):
             for k, i in enumerate(h):
                 filled[j, k] = i
         return filled
-
+    
+    def detach_from_device(results):
+        al_results=copy.deepcopy(results)
+        for key, value in al_results.items():
+            sen=[]
+            for batch in value: #batch
+                #n_best
+                n_top=[]
+                for best in batch:
+                    n_top.append(best.cpu().numpy())
+                sen.append(n_top)
+            
+            al_results[key]=sen
+        return al_results
+    # for n,value in enumerate(results["scores"]):
+    #     if len(value) < n_best:
+    #         value_last = value[-1]
+    #         num_times = n_best - len(value)
+    #         iter_value = [value_last]*num_times
+    #         results["scores"][n] = value+iter_value
+    #     results["scores"][n] = value[0:n_best]
+    # for n,value in enumerate(results["predictions"]):
+    #     if len(value) < n_best:
+    #         value_last = value[-1]
+    #         num_times = n_best - len(value)
+    #         iter_value = [value_last]*num_times
+    #         results["predictions"][n] = value+iter_value
+    #     results["predictions"][n] = value[0:n_best]
     # from results to stacked outputs
     # `final_outputs`: shape (batch_size * n_best, hyp_len)
-    predictions_list = [u.cpu().numpy() for r in results["predictions"] for u in r]
-    final_outputs = pad_and_stack_hyps(predictions_list)
+    final_outputs = pad_and_stack_hyps(
+        [u.cpu().numpy() for r in results["predictions"] for u in r], )
 
     # sequence-wise log probabilities (summed up over the sequence)
     # `scores`: shape (batch_size * n_best, 1)
-    scores = np.array([[u.item()] for r in results["scores"] for u in r]) \
-        if return_prob else None
-
-    assert final_outputs.shape[0] == batch_size * n_best
+    scores = (np.array([[u.item()] for r in results["scores"]
+                        for u in r]) if return_prob else None)
+    final_outputs={'joeynmt':final_outputs,'batch_results':detach_from_device(results)}
     return final_outputs, scores, None
 
 

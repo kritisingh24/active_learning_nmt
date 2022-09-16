@@ -9,13 +9,13 @@ import time
 from functools import partial
 from itertools import zip_longest
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from joeynmt.data import load_data
+from joeynmt.data import load_data, make_data_iter
 from joeynmt.datasets import build_dataset
 from joeynmt.helpers import (
     expand_reverse_index,
@@ -109,7 +109,8 @@ def predict(
     # if batch_size > beam_size:
     #     batch_size //= beam_size
 
-    valid_iter = data.make_iter(
+    valid_iter = make_data_iter(
+        dataset=data,
         batch_size=eval_batch_size,
         batch_type=eval_batch_type,
         shuffle=False,
@@ -176,7 +177,10 @@ def predict(
                 repetition_penalty=repetition_penalty,
                 no_repeat_ngram_size=no_repeat_ngram_size,
             )
-
+            ## unpacking
+            batch_results=output['batch_results']
+            output=output['joeynmt']
+            
         # sort outputs back to original order
         all_outputs.extend(output[sort_reverse_index])  # either hyp or ref
         valid_attention_scores.extend(attention_scores[sort_reverse_index]
@@ -292,6 +296,7 @@ def predict(
         decoded_valid,
         valid_sequence_scores,
         valid_attention_scores,
+        batch_results
     )
 
 
@@ -387,7 +392,8 @@ def test(
                 "Scoring" if return_prob == "ref" else "Decoding",
                 data_set_name,
             )
-            _, _, hypotheses, hypotheses_raw, seq_scores, att_scores, = predict(
+            
+            _, _, hypotheses, trg_tokens, trg_scores, att_scores, batch_results = predict(
                 model=model,
                 data=data_set,
                 compute_loss=save_scores,
@@ -441,7 +447,8 @@ def translate(
     cfg_file: str,
     ckpt: str = None,
     output_path: str = None,
-) -> None:
+    input_str: str = None,
+) -> Any:
     """
     Interactive translation function.
     Loads model from checkpoint and translates either the stdin input or asks for
@@ -451,22 +458,23 @@ def translate(
     :param cfg_file: path to configuration file
     :param ckpt: path to checkpoint to load
     :param output_path: path to output file
+    :param input_str: input str
     """
 
     # pylint: disable=too-many-branches
-    def _translate_data(test_data, cfg):
+    def _translate_data(test_data, cfg, compute_loss=False):
         """Translates given dataset, using parameters from outer scope."""
-        _, _, hypotheses, trg_tokens, trg_scores, _ = predict(
+        _, _, hypotheses, trg_tokens, trg_scores, att_scores, batch_results = predict(
             model=model,
             data=test_data,
-            compute_loss=False,
+            compute_loss=compute_loss,
             device=device,
             n_gpu=n_gpu,
             normalization="none",
             num_workers=num_workers,
             cfg=cfg,
         )
-        return hypotheses, trg_tokens, trg_scores
+        return hypotheses, trg_tokens, trg_scores, att_scores, batch_results
 
     cfg = load_config(Path(cfg_file))
     # parse and validate cfg
@@ -516,11 +524,12 @@ def translate(
     n_best = test_cfg.get("n_best", 1)
     beam_size = test_cfg.get("beam_size", 1)
     return_prob = test_cfg.get("return_prob", "none")
-    if not sys.stdin.isatty():  # pylint: disable=too-many-nested-blocks
+     
+    if not sys.stdin.isatty() and not cfg['active_learning'].get('query_strategy',None):  # pylint: disable=too-many-nested-blocks
         # input stream given
         for line in sys.stdin.readlines():
             test_data.set_item(line.rstrip())
-        all_hypotheses, tokens, scores = _translate_data(test_data, test_cfg)
+        all_hypotheses, tokens, scores, _, batch_results = _translate_data(test_data, test_cfg)
         assert len(all_hypotheses) == len(test_data) * n_best
 
         if output_path is not None:
@@ -545,7 +554,40 @@ def translate(
             # print to stdout
             for hyp in all_hypotheses:
                 print(hyp)
+    elif input_str:
+        # enter if str is provided
+        n_best = test_cfg.get("n_best", 4)  # #############
+        beam_size = test_cfg.get("beam_size", 1)  # #############
+        return_prob = test_cfg.get("return_prob", "hyp")  # #############
 
+        test_cfg["n_best"] = 5
+        # test_cfg["batch_size"] = 10  # CAUTION: this will raise an error if n_gpus > 1
+        test_cfg["batch_type"] = "sentence"
+        test_cfg["return_prob"] = "hyp"
+        np.set_printoptions(linewidth=sys.maxsize)  # for printing scores in stdout
+        # for adding lines....
+        if isinstance(input_str,list):
+            for line in input_str:
+                test_data.set_item(line)
+        else:
+            test_data.set_item(input_str)
+        hypotheses, tokens, scores, att_score, batch_results = _translate_data(test_data, test_cfg)
+
+        # print("JoeyNMT:")
+        # for i, (hyp, token,
+        #         score) in enumerate(zip_longest(hypotheses, tokens, scores)):
+        #     assert hyp is not None, (i, hyp, token, score)
+        #     print(f"#{i + 1}: {hyp}")
+        #     if return_prob in ["hyp"]:
+        #         if beam_size > 1:  # beam search: sequence-level scores
+        #             print(f"\ttokens: {token}\n\tsequence score: {score[0]}")
+        #         else:  # greedy: token-level scores
+        #             assert len(token) == len(score), (token, score)
+        #             print(f"\ttokens: {token}\n\tscores: {score}")
+
+        # reset cache
+        test_data.cache = {}
+        return hypotheses, tokens, scores, att_score, batch_results
     else:
         # enter interactive mode
         test_cfg["batch_size"] = 1  # CAUTION: this will raise an error if n_gpus > 1
@@ -559,7 +601,7 @@ def translate(
 
                 # every line has to be made into dataset
                 test_data.set_item(src_input.rstrip())
-                hypotheses, tokens, scores = _translate_data(test_data, test_cfg)
+                hypotheses, tokens, scores, _, batch_results = _translate_data(test_data, test_cfg)
 
                 print("JoeyNMT:")
                 for i, (hyp, token,
